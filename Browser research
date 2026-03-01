@@ -1,0 +1,58 @@
+import asyncio
+import os
+from dotenv import load_dotenv
+from browser_use import Agent, Browser
+
+# Używamy natywnego modelu z biblioteki browser-use (najbardziej stabilny)
+from browser_use.llm.openai.chat import ChatOpenAI
+
+# Wczytujemy klucz API z pliku .env
+load_dotenv()
+
+async def main():
+    # Ustawiamy widoczność okna przeglądarki
+    os.environ["BROWSER_USE_HEADLESS"] = "false"
+    
+    # Inicjalizacja przeglądarki i modelu (GPT-4o to "mózg" operacji)
+    browser = Browser()
+    llm = ChatOpenAI(model="gpt-4o", temperature=0.0)
+
+    # Definicja zadania dla Agenta
+    agent = Agent(
+        task="""
+        Go to https://ideas.scottmax.com/
+        1. If there are popups or cookie banners, close them.
+        2. You will see a list of business ideas. The main page only has previews.
+        3. Click on the first 3 business ideas, one by one.
+        4. For each idea you click into, read the potential profit and the difficulty/effort required.
+        5. After reading the details, navigate back to the main list to click the next one.
+        6. Compare the 3 ideas you just read.
+        7. Choose the ONE that has the best ratio of high profit to low difficulty.
+        8. Give me the name of the winning idea and explain your choice in Polish.
+        """,
+        llm=llm,
+        browser=browser
+    )
+
+    print("🚀 Agent startuje... Klucz API pobrany z .env. Obserwuj okno!")
+    
+    try:
+        # Uruchomienie procesu (max 25 kroków, żeby agent miał czas na klikanie)
+        history = await agent.run(max_steps=25)
+        
+        print("\n--- FINALNY WERDYKT AGENTA ---")
+        print(history.final_result())
+        
+    except Exception as e:
+        print(f"\n❌ Wystąpił błąd: {e}")
+        
+    finally:
+        # Czekamy 5 sekund przed zamknięciem, żebyś mógł zobaczyć wynik na stronie
+        await asyncio.sleep(5)
+
+if __name__ == "__main__":
+    # Sprawdzamy, czy klucz na pewno został wczytany
+    if not os.getenv("OPENAI_API_KEY"):
+        print("⚠️ BŁĄD: Nie znaleziono klucza API w pliku .env!")
+    else:
+        asyncio.run(main())
