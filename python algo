@@ -1,0 +1,351 @@
+#!/usr/bin/env python3  # Mówi systemom Linux/macOS, że to skrypt Pythona (w Windows PowerShell to ignoruje).
+import time  # Pozwala zatrzymywać działanie bota w czasie (np. time.sleep(10)).
+import json  # Służy do odczytu i zapisu plików tekstowych w formacie JSON (config i stan).
+import sqlite3  # Biblioteka do obsługi lokalnej, bezpiecznej bazy danych (nasza historia transakcji).
+import logging  # Profesjonalny system do zapisywania logów (zamiast zwykłych printów).
+import os  # Pozwala systemowi operacyjnemu sprawdzać, czy plik już istnieje na dysku.
+import requests  # Biblioteka do wysyłania żądań HTTP (choć główne API używa innej, ta przydaje się np. do Telegrama).
+from datetime import datetime  # Służy do pobierania dokładnej daty i godziny (do logów i sprawdzania czasu).
+from typing import Dict, Any, Tuple, Optional  # Pomaga w podpowiadaniu typów, co ułatwia czytanie kodu i unikanie błędów.
+from hyperliquid.info import Info  # Importuje moduł 'Info' z oficjalnego API Hyperliquid (tylko do odczytu danych).
+from hyperliquid.utils import constants  # Pobiera stałe z API Hyperliquid (np. główny adres URL giełdy).
+
+# ==========================================
+# 🛡️ MODUŁ 1: RISK MANAGER (Zarządzanie Ryzykiem)
+# ==========================================
+class RiskManager:  # Tworzymy osobną klasę, która pilnuje tylko naszego bezpieczeństwa.
+    def __init__(self, config: Dict[str, Any], logger: logging.Logger):  # Konstruktor klasy, uruchamia się przy jej tworzeniu.
+        self.config = config  # Zapisuje ustawienia bota wewnątrz Risk Managera.
+        self.logger = logger  # Przekazuje system logowania, żeby Risk Manager mógł zgłaszać problemy.
+
+    def calculate_position_size(self, current_balance: float) -> float:  # Funkcja licząca ile dolarów wejdzie w pozycję.
+        # Oblicza kwotę ryzyka (np. 1% ze 100$ to 1$).
+        risk_usd = current_balance * (self.config["risk_per_trade_pct"] / 100)  
+        # Zmienia procent Stop Loss na ułamek (np. 1.5% na 0.015).
+        sl_decimal = self.config["stop_loss_pct"] / 100  
+        # Wylicza idealną wielkość pozycji: żeby strata przy Stop Lossie wyniosła dokładnie nasze założone ryzyko (risk_usd).
+        ideal_size_usd = risk_usd / sl_decimal  
+        
+        # Sprawdza maksymalną możliwą wielkość pozycji wynikającą z dźwigni (np. 100$ * 5 = 500$).
+        max_possible_size = current_balance * self.config["leverage"]  
+        # Wybiera mniejszą wartość: albo idealną z ryzyka, albo maksymalną możliwą na koncie. Ochrona przed przekroczeniem limitu giełdy.
+        return min(ideal_size_usd, max_possible_size)  
+
+    def is_daily_loss_exceeded(self, current_balance: float, daily_start_balance: float) -> bool:  # Sprawdza nasz "Kill Switch".
+        if daily_start_balance <= 0: return False  # Zabezpieczenie przed błędem dzielenia przez zero, gdyby balans na starcie wynosił 0.
+        # Oblicza procentową zmianę stanu konta od początku dnia.
+        daily_pnl_pct = ((current_balance - daily_start_balance) / daily_start_balance) * 100  
+        # Zwraca Prawdę (True), jeśli dzisiejsza strata jest większa lub równa ustawionemu max_daily_loss_pct (np. -5%).
+        return daily_pnl_pct <= -self.config["max_daily_loss_pct"]  
+
+
+# ==========================================
+# 🧠 MODUŁ 2: STRATEGIE
+# ==========================================
+class BaseStrategy:  # Klasa bazowa (szkielet) dla każdej przyszłej strategii.
+    def get_signal(self, universe: list, ctxs: list) -> Optional[Dict[str, Any]]:  # Szkielet funkcji do pobierania sygnału.
+        raise NotImplementedError  # Wymusza, aby każda nowa strategia miała zaprogramowaną własną metodę get_signal.
+
+class FundingStrategy(BaseStrategy):  # Główna klasa naszej obecnej strategii, oparta na szukaniu najlepszego Fundingu.
+    def __init__(self, config: Dict[str, Any]):  # Konstruktor strategii.
+        self.config = config  # Zapisuje konfigurację dla strategii.
+
+    def get_signal(self, universe: list, ctxs: list) -> Optional[Dict[str, Any]]:  # Funkcja analizująca rynek w poszukiwaniu wejścia.
+        best_coin = None  # Na początku nie mamy wybranej żadnej monety.
+        max_f = 0.0  # Ustawiamy maksymalny znaleziony funding na 0.
+        
+        for i, c_data in enumerate(universe):  # Przeszukuje listę wszystkich dostępnych monet (universe).
+            ctx = ctxs[i]  # Pobiera dane rynkowe (np. cenę, wolumen) dla konkretnej monety.
+            f = float(ctx.get('funding', 0)) * 100  # Pobiera funding, zmienia tekst na liczbę i mnoży przez 100, by mieć procenty.
+            v = float(ctx.get('dayNtlVlm', 0))  # Pobiera dzienny wolumen obrotu (w dolarach).
+            
+            # Sprawdza dwa warunki: czy wolumen jest większy niż nasze minimum I czy funding jest najbardziej ekstremalny z dotychczasowych.
+            if v > self.config["min_volume_usd"] and abs(f) > abs(max_f):  
+                max_f = f  # Zapisuje nowy najwyższy znaleziony funding.
+                # Zapisuje dane najlepszej monety do słownika: nazwę, aktualną cenę (markPx) i jej funding.
+                best_coin = {"name": c_data['name'], "price": float(ctx['markPx']), "funding": f}  
+                
+        # Po przejrzeniu całego rynku sprawdza, czy znaleziona najlepsza moneta ma funding na tyle silny (np. > 0.03%), by pokryć koszty wejścia.
+        if best_coin and abs(best_coin["funding"]) >= self.config["min_abs_funding_pct"]:  
+            return best_coin  # Zwraca monetę jako sygnał do wejścia.
+        return None  # Jeśli nie znaleziono nic ciekawego, nie zwraca nic (brak sygnału).
+
+
+# ==========================================
+# ⚙️ MODUŁ 3: SILNIK GŁÓWNY (CORE)
+# ==========================================
+class KozakUltraSimV3:  # Główna klasa spinająca wszystko w całość.
+    def __init__(self, config_path: str = "config_sim_v3.json"):  # Konstruktor głównego bota.
+        self.config_path = config_path  # Ścieżka do pliku konfiguracyjnego.
+        self.state_file = "state_sim_v3.json"  # Ścieżka do pliku pamięci stanu.
+        self.db_file = "kozak_sim_v3.db"  # Ścieżka do pliku bazy danych historii transakcji.
+        self.log_file = "kozak_sim_v3.log"  # Ścieżka do pliku tekstowego z pełnymi logami bota.
+
+        logging.basicConfig(  # Konfiguracja profesjonalnego systemu logowania.
+            level=logging.INFO,  # Ustawia poziom logów (INFO = wszystko od informacji wzwyż; omija nieistotne błędy systemowe).
+            format='%(asctime)s [%(levelname)s] %(message)s',  # Format wiadomości: np. "2026-03-15 12:00:00 [INFO] Bot wystartował".
+            handlers=[  # Gdzie te logi mają trafiać?
+                logging.FileHandler(self.log_file, encoding='utf-8'),  # Zapisuj do pliku tekstowego na dysku (obsługuje polskie znaki).
+                logging.StreamHandler()  # Jednocześnie wyświetlaj te same komunikaty w konsoli (na ekranie).
+            ]
+        )
+        self.logger = logging.getLogger(__name__)  # Tworzy obiekt loggera dla tej konkretnej klasy.
+
+        self.config = self._load_config()  # Wywołuje funkcję ładowania/tworzenia ustawień z pliku config.
+        self.api = Info(constants.MAINNET_API_URL)  # Łączy się z głównym serwerem Hyperliquid (tylko odczyt danych rynkowych!).
+        self.state = self._load_state()  # Wywołuje funkcję ładującą aktualny stan konta i pozycji.
+        
+        self.strategy = FundingStrategy(self.config)  # Inicjalizuje wcześniej stworzoną strategię.
+        self.risk_manager = RiskManager(self.config, self.logger)  # Inicjalizuje "strażnika" od zarządzania ryzykiem.
+        
+        self._init_db()  # Uruchamia funkcję przygotowującą bazę danych.
+        # Loguje uroczysty start bota i podaje aktualny kapitał (balans).
+        self.logger.info(f"🚀 KozakUltraSim V3 uruchomiony | Balans: {self.state['balance']:.2f}$")  
+
+    def _load_config(self) -> Dict[str, Any]:  # Funkcja ładująca konfigurację. Zwraca słownik.
+        default_config = {  # Tworzy słownik z idealnymi domyślnymi ustawieniami dla bota.
+            "start_balance": 100.0,  # Kapitał startowy do symulacji.
+            "leverage": 5,  # Dźwignia (bezpieczniejsza, x5).
+            "risk_per_trade_pct": 1.0,  # Ryzyko na jedną transakcję w procentach kapitału.
+            "stop_loss_pct": 1.5,  # Klasyczny Stop Loss (gdzie ucinamy stratę).
+            "take_profit_pct": 5.0,  # Sztywny Take Profit (cel zysku).
+            "tsl_activation_pct": 1.0,  # Kiedy włączyć Trailing Stop (podążający zysk)? Po 1% na plusie.
+            "tsl_offset_pct": 1.0,  # O ile procent Trailing Stop ma odstawać od najwyższego szczytu.
+            "fee_rate_taker": 0.00035,  # Zwykła opłata giełdowa za realizację zlecenia rynkowego (0.035%).
+            "min_volume_usd": 1_000_000,  # Minimalny dzienny obrót monety, żeby bot w ogóle na nią spojrzał.
+            "max_position_hours": 24,  # Maksymalny czas życia pozycji. Jak minie 24h, tnie i zamyka.
+            "min_abs_funding_pct": 0.03,  # Wymagany skrajny funding, by wejść.
+            "max_daily_loss_pct": 5.0,  # Kill Switch (dzienny limit straty).
+            "spread_base_pct": 0.0005,  # Symulacja rynkowego poślizgu (Spread), tu wynosi 0.05%.
+            "loop_interval": 10  # Czas (w sekundach) pomiędzy kolejnymi pętlami skanowania rynku.
+        }
+        if os.path.exists(self.config_path):  # Sprawdza, czy plik z configiem już fizycznie istnieje na dysku.
+            with open(self.config_path, 'r', encoding='utf-8') as f:  # Otwiera ten plik do odczytu ('r').
+                loaded = json.load(f)  # Ładuje jego zawartość do pamięci jako obiekt JSON.
+                updated = False  # Zakłada, że plik nie wymaga aktualizacji.
+                for k, v in default_config.items():  # Przechodzi po wszystkich domyślnych kluczach z konfiguracji.
+                    if k not in loaded:  # Jeśli w starym pliku brakuje jakiegoś nowego klucza...
+                        loaded[k] = v  # Dodaje ten klucz do załadowanej pamięci.
+                        updated = True  # Oznacza, że zaktualizował strukturę.
+                if updated:  # Jeśli cokolwiek zaktualizował...
+                    with open(self.config_path, 'w', encoding='utf-8') as wf: json.dump(loaded, wf, indent=4)  # Zapisuje poprawiony plik na dysk.
+                return loaded  # Zwraca poprawną konfigurację do bota.
+        # Jeśli plik config w ogóle nie istniał, tworzy go z domyślnymi wartościami.
+        with open(self.config_path, 'w', encoding='utf-8') as f: json.dump(default_config, f, indent=4)  
+        return default_config  # Zwraca nowo utworzony, domyślny config.
+
+    def _load_state(self) -> Dict[str, Any]:  # Funkcja ładująca pamięć roboczą bota (balans, aktualny trade).
+        defaults = {  # Przygotowuje pustą "czystą kartę" (stan domyślny).
+            "balance": self.config["start_balance"],  # Stan konta pobrany z configu.
+            "daily_start_balance": self.config["start_balance"],  # Balans do wyliczania straty dziennej (na początek dnia).
+            "current_date": datetime.now().strftime("%Y-%m-%d"),  # Dzisiejsza data, potrzebna do resetowania dnia.
+            "daily_pnl_blocked": False,  # Flaga mówiąca o tym, czy włączono Kill Switch (domyślnie Fałsz).
+            "in_position": False,  # Flaga określająca, czy bot jest obecnie w transakcji na rynku.
+            "coin": None, "side": None, "entry_price": 0.0,  # Zmienne przechowujące dane otwartej pozycji (puste).
+            "size_usd": 0.0, "fees_paid": 0.0, "funding_earned": 0.0,  # Zmienne przechowujące księgowość dla danej pozycji.
+            "open_time": None, "peak_price": 0.0, "last_funding_hour": datetime.now().hour  # Czas otwarcia, najwyższa cena i czas ostatniego fundingu.
+        }
+        if os.path.exists(self.state_file):  # Jeśli plik pamięci istnieje z poprzedniego uruchomienia...
+            try:  # Próbuje bezpiecznie go wczytać.
+                with open(self.state_file, 'r', encoding='utf-8') as f:  # Otwiera plik.
+                    loaded = json.load(f)  # Wczytuje.
+                    for k, v in defaults.items():  # Aktualizuje tak samo jak config, gdyby brakowało nowych kluczy.
+                        if k not in loaded: loaded[k] = v
+                    return loaded  # Zwraca wczytany stan z dysku.
+            except Exception as e:  # Jeśli coś pójdzie nie tak (np. plik zepsuty przy awarii zasilania)...
+                self.logger.warning(f"Nie można załadować {self.state_file}: {e}. Tworzę nowy stan.")  # Informuje o błędzie.
+        return defaults  # Zwraca czysty stan domyślny, gdy pliku nie było.
+
+    def _save_state(self) -> None:  # Funkcja zapisująca obecny stan pamięci bota na dysk do pliku.
+        with open(self.state_file, 'w', encoding='utf-8') as f: json.dump(self.state, f, indent=4)
+
+    def _init_db(self) -> None:  # Funkcja przygotowująca strukturę bazy danych SQLite.
+        try:
+            with sqlite3.connect(self.db_file) as conn:  # Otwiera/Tworzy bezpieczne połączenie do pliku bazy danych.
+                cursor = conn.cursor()  # Tworzy kursor, czyli takie 'pióro' do pisania zapytań SQL w bazie.
+                cursor.execute("""  # Wykonuje polecenie SQL tworzące tabelę.
+                    CREATE TABLE IF NOT EXISTS trades (  -- Utwórz tabelę 'trades', tylko jeśli jeszcze nie istnieje.
+                        id INTEGER PRIMARY KEY AUTOINCREMENT,  -- Unikalny numer transakcji, sam się powiększa.
+                        timestamp TEXT, coin TEXT, side TEXT,  -- Kiedy, jaka moneta, jaka strona (LONG/SHORT).
+                        entry_price REAL, exit_price REAL, size_usd REAL,  -- Ceny i wielkość w ułamkach (REAL = float).
+                        gross_pnl REAL, fees REAL, funding_earned REAL,  -- Wynik brutto, prowizje i zarobiony funding.
+                        net_pnl REAL, balance_after REAL, close_reason TEXT, duration_hours REAL  -- Wynik netto, balans po transakcji, powód wyjścia i czas.
+                    )
+                """)  # Koniec polecenia SQL.
+                conn.commit()  # Zatwierdza i zapisuje na stałe tabelę na dysku.
+        except Exception as e:  # W razie błędu przy zakładaniu bazy danych...
+            self.logger.error(f"❌ Błąd inicjalizacji SQLite: {e}")  # Zapisuje wielki czerwony log z błędem.
+
+    def get_api_data_safe(self) -> Tuple[Optional[list], Optional[list]]:  # Bezpieczna funkcja do pobierania danych z giełdy.
+        try:  # Próbuje...
+            data = self.api.meta_and_asset_ctxs()  # Pobrać paczkę wszystkich danych o wszystkich monetach z serwerów Hyperliquid.
+            return data[0]['universe'], data[1]  # Jeśli się udało, rozpakowuje i zwraca 'universe' (nazwy) i 'ctxs' (ceny/funding).
+        except Exception as e:  # Jeśli API rzuci błędem (Timeout, giełda leży, padł Twój internet)...
+            self.logger.error(f"⚠️ Błąd połączenia z API Hyperliquid: {e}. Ponawiam za 15s...")  # Zapisuje log zamiast zamykać bota.
+            time.sleep(15)  # Daje serwerowi i botowi 15 sekund na uspokojenie sytuacji.
+            return None, None  # Zwraca puste dane. Główna pętla zobaczy, że puste, i ponowi próbę za chwilę.
+
+    def open_position(self, coin: str, raw_price: float, funding_rate: float) -> None:  # Funkcja wykonująca otwarcie pozycji.
+        side = "SHORT" if funding_rate > 0 else "LONG"  # Logika fundingu: Jeśli funding rynkowy płaci dodatnio, gramy SHORT (żeby nam płacili).
+        
+        # Oblicza cenę wejścia symulując Spread (poślizg rynkowy). Dla LONG dodaje poślizg (kupujesz drożej), dla SHORT odejmuje (sprzedajesz taniej).
+        entry_price = raw_price * (1 + self.config["spread_base_pct"]) if side == "LONG" else raw_price * (1 - self.config["spread_base_pct"])
+        
+        # Prosi Risk Managera o obliczenie wielkości pozycji w dolarach w oparciu o nasz % ryzyka i aktualny balans.
+        size_usd = self.risk_manager.calculate_position_size(self.state["balance"])
+        # Wylicza ile wzięłaby giełda (fee) z tak otwartej pozycji (po zleceniu Market/Taker).
+        entry_fee = size_usd * self.config["fee_rate_taker"]
+        
+        # Aktualizuje stan bota o wszystkie nowe dane nowo otwartej pozycji.
+        self.state.update({
+            "in_position": True, "coin": coin, "side": side,  # Przełącza flagę na True, zapisuje monetę i stronę.
+            "entry_price": entry_price, "peak_price": entry_price,  # Zapisuje wejście. Szczyt (peak_price) to na razie cena wejścia.
+            "size_usd": size_usd, "fees_paid": entry_fee,  # Zapisuje wielkość i opłacone pierwsze fee.
+            "funding_earned": 0.0, "open_time": datetime.now().isoformat()  # Startuje licznik zarobku z fundingu i notuje dokładny czas.
+        })
+        self._save_state()  # Natychmiast rzuca to na dysk (plik JSON), żeby bot pamiętał po restarcie prądu.
+        self.logger.info(f"🟢 OPEN {side} {coin} | Cena: {entry_price:.5f} | Wartość: {size_usd:.2f}$")  # Loguje sukces.
+
+    def close_position(self, raw_exit_price: float, reason: str) -> None:  # Funkcja zamykająca naszą symulowaną pozycję.
+        side = self.state["side"]  # Pobiera ze swojej pamięci informację w jakiej jest pozycji (LONG czy SHORT).
+        entry = self.state["entry_price"]  # Pobiera cenę, po której wszedł.
+        
+        # Znowu symuluje brutalny rynek i dolicza karę ze spreadu przy zamykaniu.
+        exit_price = raw_exit_price * (1 - self.config["spread_base_pct"]) if side == "LONG" else raw_exit_price * (1 + self.config["spread_base_pct"])
+        
+        # Liczy surowy zysk/stratę procentową z samej zmiany ceny, biorąc pod uwagę kierunek zagrania.
+        change_pct = ((exit_price - entry) / entry * 100) if side == "LONG" else ((entry - exit_price) / entry * 100)
+        # Zamienia te procenty na fizyczne dolary zysku lub straty na podstawie wielkości pozycji.
+        gross_pnl = (change_pct / 100) * self.state["size_usd"]
+        
+        # Liczy koszt zamknięcia pozycji.
+        exit_fee = self.state["size_usd"] * self.config["fee_rate_taker"]
+        total_fees = self.state["fees_paid"] + exit_fee  # Sumuje koszty wejścia i wyjścia.
+        funding = self.state["funding_earned"]  # Pobiera uciułany w trakcie trwania pozycji funding.
+        net_pnl = gross_pnl + funding - total_fees  # Święty Graal: Zysk z kursu + Zysk z fundingu - Wszystkie koszty giełdy.
+        
+        self.state["balance"] += net_pnl  # Dodaje ten ostateczny wynik netto do całkowitego balansu konta.
+        open_time = datetime.fromisoformat(self.state["open_time"])  # Odczytuje, kiedy ten trade się zaczął.
+        duration_hrs = round((datetime.now() - open_time).total_seconds() / 3600, 2)  # Liczy ile godzin trwał ten cały cyrk.
+        
+        # Zapis do naszej bazy danych SQLite (na sztywno ląduje na dysku, bezpiecznie).
+        with sqlite3.connect(self.db_file) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""  -- Wysyła to samo wielkie polecenie SQL wprowadzające pełne dane o trade'dzie.
+                INSERT INTO trades (timestamp, coin, side, entry_price, exit_price, size_usd, gross_pnl, fees, funding_earned, net_pnl, balance_after, close_reason, duration_hours)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (datetime.now().strftime("%Y-%m-%d %H:%M:%S"), self.state["coin"], side, entry, exit_price, self.state["size_usd"], gross_pnl, total_fees, funding, net_pnl, self.state["balance"], reason, duration_hrs))
+            conn.commit()
+            
+        # Wypluwa ładny, czytelny raport o zamknięciu do pliku log i do okna konsoli.
+        self.logger.info(f"🔴 CLOSE {reason} {self.state['coin']} | Net PnL: {net_pnl:+.2f}$ | Nowy Balans: {self.state['balance']:.2f}$")
+        
+        # Resetuje pamięć - ustawia, że już nie ma otwartej pozycji, kasuje nazwę monety z głowy.
+        self.state.update({"in_position": False, "coin": None, "peak_price": 0.0})
+        
+        # Bardzo ważne zapytanie: Czy ten trade sprawił, że nasza dzienna strata przekroczyła Kill Switch (-5%)?
+        if self.risk_manager.is_daily_loss_exceeded(self.state["balance"], self.state["daily_start_balance"]):
+            self.state["daily_pnl_blocked"] = True  # Przekręca klucz Kill Switcha!
+            self.logger.error("🛑 KILL SWITCH AKTYWNY! Przekroczono maksymalną stratę dzienną. Handel wstrzymany do jutra.")
+            
+        self._save_state()  # Zapisuje wszystko na dysk.
+
+    def run(self) -> None:  # Główne serce - pętla, w której bot zamyka się i w której bezustannie się kręci.
+        while True:  # Start nieskończonej pętli dopóki nie wyłączysz programu klawiszami Ctrl+C.
+            
+            # 1. Sprawdzanie nadejścia północy i nowego dnia.
+            today_str = datetime.now().strftime("%Y-%m-%d")  # Pobiera dzisiejszą datę.
+            if self.state.get("current_date") != today_str:  # Jeśli data w pamięci różni się od dzisiejszej (wybiła północ)...
+                # Uaktualnia datę, zapisuje aktualny stan jako startowy dla nowego dnia i ODBLOKOWUJE Kill Switcha.
+                self.state.update({"current_date": today_str, "daily_start_balance": self.state["balance"], "daily_pnl_blocked": False})
+                self._save_state()
+                self.logger.info(f"🔄 Nowy dzień handlowy ({today_str}). Zresetowano Kill Switch.")
+
+            # Jeśli Kill Switch jest włączony (blokada), bot usypia na minutę i zaczyna pętlę od nowa. Czeka aż wybije północ.
+            if self.state.get("daily_pnl_blocked"):
+                time.sleep(60)
+                continue
+
+            # 2. Bezpiecznie prosi serwery Hyperliquid o nową paczkę notowań (universe) i statystyk (ctxs).
+            universe, ctxs = self.get_api_data_safe()
+            if not universe or not ctxs:  # Jeśli nasza funkcja API zwróciła None (czyli był błąd internetu)...
+                continue  # Pomiń dalszą analizę w tej pętli, zacznij od początku.
+
+            # 3. KIEDY JESTEŚMY POZA RYNKIEM (Szukamy okazji).
+            if not self.state["in_position"]:
+                # Prosi o strategię: "Masz tu notowania i statystyki. Masz coś dla mnie?"
+                signal = self.strategy.get_signal(universe, ctxs)
+                if signal:  # Jeśli strategia powiedziała "Tak, wchodzimy w ten coin!"
+                    # Uruchamia wejście na rynek przy użyciu danych wyplutych przez strategię.
+                    self.open_position(signal["name"], signal["price"], signal["funding"])
+            
+            # 4. KIEDY JESTEŚMY W TRANSAKCJI (Pilnujemy jej).
+            else:
+                # W wielkim worku monet (universe) szukamy tej jednej konkretnej, w której teraz jesteśmy włożeni.
+                idx = next((i for i, c in enumerate(universe) if c['name'] == self.state['coin']), None)
+                if idx is None: continue  # Jeśli w dziwnych okolicznościach moneta zniknęła z giełdy, pominie iterację.
+                
+                cur_p = float(ctxs[idx]['markPx'])  # Wyciąga aktualną, świeżą cenę naszej monety na tę sekundę.
+                entry = self.state["entry_price"]  # Wyciąga naszą cenę z pamięci.
+                side = self.state["side"]  # Pobiera kierunek z pamięci.
+                
+                # Zabezpieczamy Trailing Stop (Podążający Zysk): Jeśli cena pobiła nasz dotychczasowy szczyt (zależy od kierunku)...
+                if (side == "LONG" and cur_p > self.state["peak_price"]) or (side == "SHORT" and cur_p < self.state["peak_price"]):
+                    self.state["peak_price"] = cur_p  # Aktualizuje w pamięci najwyższą odnotowaną cenę.
+                    self._save_state()
+
+                # Symulacja księgowania stałych przelewów z fundingu (bardzo uproszczona symulacja ciągłego modelu HL, nalicza co nową godzinę).
+                current_hour = datetime.now().hour
+                if current_hour != self.state.get("last_funding_hour", current_hour):  # Wskazówka zegara wybiła nową pełną godzinę.
+                    f_rate = float(ctxs[idx].get('funding', 0))  # Pobiera aktualny wskaźnik funding rate z API.
+                    payment = self.state["size_usd"] * f_rate  # Oblicza kwotę płatności zależną od wielkości pozycji.
+                    # Pamiętaj: w krypto jeśli płacisz – tracisz, jeśli Ci płacą – zyskujesz. Bot kieruje się sentymentem.
+                    if side == "LONG": self.state["funding_earned"] -= payment
+                    else: self.state["funding_earned"] += payment
+                    self.state["last_funding_hour"] = current_hour  # Odnotowuje godzinę by nie zapłacić dwa razy za tę samą.
+                    self._save_state()
+
+                # LIMIT CZASU TRANSAKCJI (Zabezpieczenie by kapitał nie utknął "bokiem").
+                open_time = datetime.fromisoformat(self.state["open_time"])
+                # Oblicza ilość godzin spędzonych na rynku w tej transakcji.
+                if (datetime.now() - open_time).total_seconds() / 3600 >= self.config["max_position_hours"]:
+                    # Wyrzuca z rynku z powodu upływu terminu.
+                    self.close_position(cur_p, "TIME_LIMIT")
+                    continue  # Wraca na górę pętli, bo nie ma sensu liczyć Stop Lossów skoro już go zamknął.
+
+                # Matematyka do Stop Loss / Trailing Stop: o ile % zmieniła się cena?
+                change = ((cur_p - entry) / entry * 100) if side == "LONG" else ((entry - cur_p) / entry * 100)
+                
+                # Czy zaszliśmy odpowiednio daleko w strefę zysku, aby włączyć Trailing Stop?
+                is_tsl_active = change >= self.config["tsl_activation_pct"]
+                
+                # Ustalanie ucieczki z rynku
+                if is_tsl_active:
+                    # Trailing Stop: Oblicza linię Stop Lossa, która podąża za naszym szczytem "peak_price".
+                    offset = self.config["tsl_offset_pct"] / 100
+                    tsl_price = self.state["peak_price"] * (1 - offset) if side == "LONG" else self.state["peak_price"] * (1 + offset)
+                    is_hit = cur_p <= tsl_price if side == "LONG" else cur_p >= tsl_price  # Uderzyliśmy we wlekącego się Stop Lossa?
+                else:
+                    # Klasyczny twardy Stop Loss poniżej (lub powyżej) ceny wejścia. Nie chroni zysku, chroni przed ogromną stratą.
+                    sl_val = self.config["stop_loss_pct"] / 100
+                    base_sl = entry * (1 - sl_val) if side == "LONG" else entry * (1 + sl_val)
+                    is_hit = cur_p <= base_sl if side == "LONG" else cur_p >= base_sl  # Uderzyliśmy w Stop Lossa bezpieczeństwa?
+
+                # Kiedy któryś z powyższych warunków padnie jako PRAWDA (straciliśmy limit na ryzyko).
+                if is_hit:
+                    # Zamknij z przypiętą łatką w historii: Czy to był Stop Loss czy ratujący trochę zysku Trailing Stop?
+                    self.close_position(cur_p, "TRAILING_STOP" if is_tsl_active else "STOP_LOSS")
+                
+                # Alternatywa: Zdobyliśmy szczyt Take Profit określony w JSON, weź kasę ze stołu i uciekaj.
+                elif change >= self.config["take_profit_pct"]:
+                    self.close_position(cur_p, "TAKE_PROFIT")
+
+            # Pozwól zasnąć skryptowi (nie procesorowi i API Hyperliquid). Koniec jednej iteracji, czeka np. 10 sekund do następnej.
+            time.sleep(self.config["loop_interval"])
+
+if __name__ == "__main__":  # Jeśli ten skrypt został uruchomiony jako główny program z konsoli (a nie został zaimportowany gdzie indziej).
+    bot = KozakUltraSimV3()  # Stwórz wirtualnego robota handlowego na podstawie naszej ogromnej "formy" klasy KozakUltraSimV3.
+    try:
+        bot.run()  # Naciśnij guzik START (Uruchom wewnętrzną pętlę i nie przerywaj).
+    except KeyboardInterrupt:  # Ten błąd występuje tylko i wyłącznie wtedy, gdy użytkownik naciśnie kombinację "Ctrl+C" w konsoli.
+        bot.logger.info("🛑 Zatrzymano bota ręcznie (Ctrl+C).")  # Zapisz w logach, że to sam szef go wyłączył, nie że wybuchł.
